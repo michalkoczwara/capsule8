@@ -17,37 +17,52 @@ endif
 # Automated build unique identifier (if any)
 BUILD=$(shell echo ${BUILD_ID})
 
-# 'go build' flags
-GOBUILDFLAGS+=-ldflags "-X $(PKG)/pkg/version.Version=$(VERSION) -X $(PKG)/pkg/version.Build=$(BUILD)"
-GOVETFLAGS+=-shadow
+# Allow DOCKER to be set on invocation of make to prefix "sudo", for example
+DOCKER?=docker
 
-# Test build flags
-GOTESTFLAGS+=
+# Allow GO_BUILD to be set on invocation of make to customize behavior
+GO_BUILD?=go build
+GO_BUILD_FLAGS+=-ldflags "-X $(PKG)/pkg/version.Version=$(VERSION) -X $(PKG)/pkg/version.Build=$(BUILD)"
 
-# Test execution flags
-TESTFLAGS+=
+GO_FMT?=go fmt
+GO_FMT_FLAGS+=
 
-# 'docker run' flags
-DOCKERRUNFLAGS+=
+GO_LINT?=golint
+GO_LINTFLAGS+=
+
+# allow GO_TEST to be set on invocation of make to customize behavior
+GO_TEST?=go test
+GO_TEST_FLAGS+=
+
+GO_VET?=go vet
+GO_VET_FLAGS+=-shadow
+
+# Extra test execution flags (e.g. glog flags like -v=2)
+TEST_FLAGS+=
+
+# Extra 'docker run' flags
+DOCKER_RUN_FLAGS+=
 
 # Need to use clang instead of gcc for -msan, specify its path here
-CLANG=clang
+CLANG?=clang
 
 # Needed to regenerate code from protos
 PROTOC_GEN_GO=${GOPATH}/bin/protoc-gen-go
-PROTO_INC=-I../:third_party/googleapis 
+PROTO_INC=-I../:third_party/protobuf/src:third_party/googleapis 
 
-# All command-line executables in cmd/
 CMDS=$(notdir $(wildcard ./cmd/*))
-BINS=$(patsubst %,bin/%,$(CMDS))
+EXAMPLES=$(notdir $(wildcard ./examples/*))
+BINS=$(patsubst %,bin/%,$(CMDS)) \
+	$(patsubst %,bin/%,$(EXAMPLES)) \
+	test/functional/functional.test
 
 # All source directories that need to be checked, compiled, tested, etc.
 SRC=./cmd/... ./pkg/... ./examples/...
 
 #
-# Docker flags to use in CI
+# Docker flags to use for builder
 #
-DOCKER_RUN_CI=docker run                                                    \
+DOCKER_RUN_BUILDER=$(DOCKER) run                                            \
 	--network host                                                      \
 	-ti                                                                 \
 	--rm                                                                \
@@ -55,14 +70,15 @@ DOCKER_RUN_CI=docker run                                                    \
 	-v "$$(pwd):/go/src/$(PKG)"                                         \
 	-v /var/run/docker.sock:/var/run/docker.sock:ro                     \
 	-w /go/src/$(PKG)                                                   \
-	$(BUILD_IMAGE)
+	$(BUILDER_IMAGE)
 
 #
 # Docker flags to use to run the capsule8 container
 #
-DOCKER_RUN=docker run                                                       \
+DOCKER_RUN=$(DOCKER) run                                                    \
 	--privileged                                                        \
-	$(DOCKERRUNFLAGS)                                                   \
+	$(DOCKER_RUN_FLAGS)                                                 \
+	--name capsule8-sensor                                              \
 	--rm                                                                \
 	-v /proc:/var/run/capsule8/proc/:ro                                 \
 	-v /sys/kernel/debug:/sys/kernel/debug                              \
@@ -75,21 +91,27 @@ DOCKER_RUN=docker run                                                       \
 #
 # Docker flags to use to run the functional test container
 #
-DOCKER_RUN_FUNCTIONAL_TEST=docker run                                       \
+DOCKER_RUN_FUNCTIONAL_TEST=$(DOCKER) run                                    \
 	-v /var/run/capsule8:/var/run/capsule8                              \
 	-v /var/run/docker.sock:/var/run/docker.sock                        \
 	$(FUNCTIONAL_TEST_IMAGE)
 
-.PHONY: all api ci ci_shell builder build_image container load save run     \
-	shell static dist check test test_verbose test_all test_msan        \
-	test_race test_functional build_test_functional_image               \
-	run_test_functional_image clean
-	run_test_functional_image run_background clean
+.PHONY: all api builder run_builder container load save                     \
+	run_sensor run_sensor_detach shell static dist check                \
+	test test_verbose test_all test_msan test_race test_functional      \
+	functional_test	run_functional_test clean
 
 #
 # Default target: build all executables
 #
 all: $(BINS)
+
+#
+# Build all executables as static executables
+#
+static: GO_BUILD:=CGO_ENABLED=0 $(GO_BUILD)
+static: GO_BUILD_FLAGS=-a
+static: clean all
 
 api: ../capsule8/api/v0/*.proto
         # Compile grpc and gateway stubs
@@ -101,65 +123,60 @@ api: ../capsule8/api/v0/*.proto
 #
 # Build all container images
 #
-containers: container_image functional_test_image
+containers: builder container functional_test
 
-#
-# Default CI target
-#
-ci: | clean builder build_image
-	$(DOCKER_RUN_CI) /bin/sh -c "                                           \
-		./build/build.sh &&                                             \
-		./build/test.sh                                                 \
-	    "
+builder: Dockerfile.builder
+	$(DOCKER) build -f Dockerfile.builder .
+	$(eval BUILDER_IMAGE=$(shell $(DOCKER) build -q -f Dockerfile.builder .))
 
-ci_shell: | builder build_image
-	$(DOCKER_RUN_CI) /bin/sh
+# Run a shell within the builder container
+run_builder: Dockerfile.builder builder_image
+	$(DOCKER_RUN_BUILDER)
 
-builder: build/Dockerfile
-	docker build build/
-
-build_image:
-	$(eval BUILD_IMAGE=$(shell docker build -q build/))
-
-container: Dockerfile static
-	docker build --build-arg vcsref=$(SHA) --build-arg version=$(VERSION) .
-	$(eval CONTAINER_IMAGE=$(shell docker build -q .))
-
-container_image: container
+container: GO_BUILD:=CGO_ENABLED=0 $(GO_BUILD)
+container: bin/sensor Dockerfile
+	$(DOCKER) build --build-arg vcsref=$(SHA) --build-arg version=$(VERSION) .
+	$(eval CONTAINER_IMAGE=$(shell $(DOCKER) build -q .))
 
 load: capsule8-$(VERSION).tar
-	docker load -i $<
+	$(DOCKER) load -i $<
 
 save: capsule8-$(VERSION).tar
 
-capsule8-$(VERSION).tar: container_image
-	docker save -o $@ $(CONTAINER_IMAGE)
+capsule8-$(VERSION).tar: container
+	$(DOCKER) save -o $@ $(CONTAINER_IMAGE)
 
-run: DOCKERRUNFLAGS+=-ti
-run: container
+# Run sensor container in foreground
+run_sensor: DOCKER_RUN_FLAGS+=-ti
+run_sensor: container
 	$(DOCKER_RUN)
 
-run_background: DOCKERRUNFLAGS+=-d
-run_background: container
+# Run sensor container in background
+run_sensor_detach: DOCKER_RUN_FLAGS+=-d
+run_sensor_detach: container
 	$(DOCKER_RUN)
+
+# Build docker image for the functional test suite
+functional_test: GO_TEST:=CGO_ENABLED=0 $(GO_TEST)
+functional_test: test/functional/functional.test
+	$(DOCKER) build ./test/functional
+	$(eval FUNCTIONAL_TEST_IMAGE=$(shell $(DOCKER) build -q ./test/functional))
+
+# Run docker image for the functional test suite
+run_functional_test: functional_test
+	$(DOCKER_RUN_FUNCTIONAL_TEST) $(TEST_FLAGS)
 
 #
 # Run an interactive shell within the docker container with the
 # required ports and mounts. This is useful for debugging and testing
 # the environment within the continer.
 #
-shell: DOCKERRUNFLAGS+=-ti
+shell: DOCKER_RUN_FLAGS+=-ti
 shell: container
 	$(DOCKER_RUN) /bin/sh
 
 #
-# Build all executables as static executables
-#
-static:
-	CGO_ENABLED=0 GOBUILDFLAGS=-a $(MAKE) -B $<
-
-#
-# Make a distribution tarball
+# Make a binary distribution tarball
 #
 dist: static
 	tar -czf capsule8-$(VERSION).tar.gz bin/ ./examples/ ./vendor/
@@ -168,31 +185,33 @@ dist: static
 # Pattern rules to allow 'make foo' to build ./cmd/foo or ./test/cmd/foo (whichever exists)
 #
 bin/% : cmd/% cmd/%/*.go
-	go build $(GOBUILDFLAGS) -o $@ ./$<
+	$(GO_BUILD) $(GO_BUILD_FLAGS) -o $@ ./$<
+
+bin/% : examples/% examples/%/*.go
+	$(GO_BUILD) $(GO_BUILD_FLAGS) -o $@ ./$<
 
 #
 # Check that all sources build successfully, gofmt, go vet, golint, etc)
 #
 check:
-	echo "--- Checking source code formatting"
-	find ./cmd ./pkg ./examples -name '*.go' | xargs gofmt -d
 	echo "--- Checking that all sources build"
-	go build $(SRC)
+	$(GO_BUILD) $(SRC)
+	echo "--- Checking source code formatting"
+	$(GO_FMT) $(SRC)
 	echo "--- Checking that all sources vet clean"
-	go vet $(GOVETFLAGS) $(SRC)
+	$(GO_VET) $(GO_VET_FLAGS) $(SRC)
 	echo "--- Checking sources for lint"
-	golint $(SRC)
+	$(GO_LINT) $(SRC)
 
 #
-# Run all unit tests quickly
+# Run unit tests
 #
-test: GOTESTFLAGS+=-cover
+test: GO_TEST_FLAGS+=-cover
 test:
-	go test $(GOTESTFLAGS) $(SRC) $(TESTFLAGS)
+	$(GO_TEST) $(GO_TEST_FLAGS) $(SRC) $(TEST_FLAGS)
 
-test_verbose: GOTESTFLAGS+=-v
-test_verbose:
-	go test $(GOTESTFLAGS) $(SRC) $(TESTFLAGS)
+test_verbose: GO_TEST_FLAGS+=-v
+test_verbose: test
 
 #
 # Run all tests
@@ -202,38 +221,24 @@ test_all: test test_msan test_race
 #
 # Run all unit tests in pkg/ under memory sanitizer
 #
-test_msan: GOTESTFLAGS+=-msan
-test_msan:
-	CC=${CLANG} go test $(GOTESTFLAGS) $(SRC) $(TESTFLAGS)
+test_msan: GO_TEST_FLAGS+=-msan
+test_msan: GO_TEST:=CC=${CLANG} $(GO_TEST)
+test_msan: test
 
 #
 # Run all unit tests in pkg/ under race detector
 #
-test_race: GOTESTFLAGS+=-race
-test_race:
-	go test $(GOTESTFLAGS) $(SRC) $(TESTFLAGS)
+test_race: GO_TEST_FLAGS+=-race
+test_race: test
 
 #
-# Run functional test suite
+# Run functional test suite (requires sensor to be already running)
 #
 test_functional:
-	go test ./test/functional $(GOTESTFLAGS)
+	go test ./test/functional $(GO_TEST_FLAGS)
 
 test/functional/functional.test: test/functional/*.go
-	CGO_ENABLED=0 go test $(GOTESTFLAGS) -c -o $@ ./test/functional
-
-#
-# Build docker image for the functional test suite
-#
-functional_test_image: test/functional/functional.test
-	docker build ./test/functional
-	$(eval FUNCTIONAL_TEST_IMAGE=$(shell docker build -q ./test/functional))
-
-#
-# Run docker image for the functional test suite
-#
-run_functional_test: functional_test_image
-	$(DOCKER_RUN_FUNCTIONAL_TEST) $(TESTFLAGS)
+	$(GO_TEST) $(GO_TEST_FLAGS) -c -o $@ ./test/functional
 
 clean:
 	rm -rf $(BINS)

@@ -1,5 +1,24 @@
 # Hacking on Capsule8
 
+## Local CI
+
+Capsule8 uses CircleCI 2.0 for continuous integration testing.
+
+[Installing the CLI](https://circleci.com/docs/2.0/local-jobs/) and
+running CI locally before submitting a PR is highly recommended since
+it vastly improves iteration speed. To run the CI job, just run
+`circleci build` from the top-level of your check out:
+
+```
+$ circleci build
+
+====>> Spin up Environment
+Build-agent version 0.0.4606-189b121 (2017-12-22T21:13:51+0000)
+Starting container circleci/golang
+  using image circleci/golang@sha256:dad9d639804f824af8d12b01bf5b8cd7fceb60e2bbc6a288e2161894e9b7fe0a
+[...]
+```
+
 ## Sensor
 
 ### Logging and Tracing
@@ -13,75 +32,69 @@ file with `-vmodule=process_info=11`.
 
 ### Functional Tests
 
-The functional tests in `test/functional` require privileges to run
-the `docker` command and reach the Sensor's gRPC API endpoint so they
-can be run with `sudo` if necessary:
+The functional tests expect to be able to communicate with a running
+Capsule8 Sensor and run Docker containers to monitor. The easiest way
+to run the functional tests is by using the `Makefile` targets that
+run the Sensor and functional tests within Docker containers.
+
+First, run the Capsule8 Sensor docker container detached:
 
 ```
-$ env GOTESTFLAGS="-exec sudo" make test_functional
-go test -exec sudo ./test/functional
-[sudo] password for user:
+$ make run_sensor_detach
 [...]
+docker run --privileged -d --name capsule8-sensor --rm -v /proc:/var/run/capsule8/proc/:ro -v /sys/kernel/debug:/sys/kernel/debug -v /sys/fs/cgroup:/sys/fs/cgroup -v /var/lib/docker:/var/lib/docker:ro -v /var/run/capsule8:/var/run/capsule8 -v /var/run/docker:/var/run/docker:ro sha256:e312365e4838c439b9d032413ff2cd9ad61c45ecd7a22e356b9b857e88e8bdfd
+5245331f0008f54095ae2b64f0f24cf44a9509f4cc0c9b1e826e72c835f789a9
+```
+
+```
+$ make run_functional_test
+docker run -v /var/run/capsule8:/var/run/capsule8 -v /var/run/docker.sock:/var/run/docker.sock sha256:bc5369c69a73ecfddc01f3d7e1a26578966149fdbaed7af879e44e8aaf1d7843 
+PASS
+```
+
+You can now stop the detached sensor container by name:
+```
+$ docker stop capsule8-sensor
 ```
 
 #### Running Functional Tests on a Remote Host
 
-The functional tests have been designed to support being run against a
-remote Capsule8 API and Docker host.
+The recommended way to run both the sensor and the functional tests on
+a remote host is by setting the `DOCKER_HOST` environment variable to
+the appropriate Docker socket.
 
 ```
-make CAPSULE8_API_SERVER=127.0.0.1:8484 DOCKER_HOST=tcp://127.0.0.1:2375 test_functional
-
+$ make DOCKER_HOST=tcp://127.0.0.1:2375 run_sensor_detached
+[...]
+$ make DOCKER_HOST=tcp://127.0.0.1:2375 run_functional_test
+[...]
 ```
 
 #### Debugging Functional Tests
 
-In order to debug functional tests, first run the failing test
-individually with `v=1`. This V-level causes the test to log
-intermediate status information.
+The functional test container logs verbose output to
+`/var/lib/capsule8/log/` by default and these logs can be copied out
+with `docker cp`:
 
 ```
-$ make GOTESTFLAGS="-test.v -test.parallel 1 -test.run Crash -args -v=1" test_functional 2>test.out
+$ docker cp 51fd59662c80:/var/lib/capsule8/log /tmp/51fd59662c80
+$ ls /tmp/51fd59662c80/
+functional.test.51fd59662c80.unknownuser.log.INFO.20171224-221923.1  functional.test.INFO@
+```
+
+Additional flags can be specified to the test runner by setting the
+`TEST_FLAGS` Makefile variable:
+
+```
+$ make TEST_FLAGS="-test.v -test.parallel 1 -test.run Crash -v=10" run_functional_test
+[...]
 === RUN   TestCrash
-=== RUN   TestExit
-=== RUN   TestSignal
 === RUN   TestCrash/buildContainer
 === RUN   TestCrash/runTelemetryTest
---- PASS: TestCrash (1.50s)
-    --- PASS: TestCrash/buildContainer (0.11s)
-    --- PASS: TestCrash/runTelemetryTest (1.39s)
-=== RUN   TestSignal/buildContainer
-=== RUN   TestSignal/runTelemetryTest
---- FAIL: TestSignal (10.15s)
-    --- PASS: TestSignal/buildContainer (0.15s)
-    --- FAIL: TestSignal/runTelemetryTest (10.00s)
-    	telemetry_test.go:90: rpc error: code = DeadlineExceeded desc = context deadline exceeded
-	telemetry_test.go:101: Couldn't run telemetry tests
-=== RUN   TestExit/buildContainer
-=== RUN   TestExit/runTelemetryTest
---- FAIL: TestExit (10.13s)
-    --- PASS: TestExit/buildContainer (0.13s)
-    --- FAIL: TestExit/runTelemetryTest (10.00s)
-    	telemetry_test.go:90: rpc error: code = DeadlineExceeded desc = context deadline exceeded
-	telemetry_test.go:101: Couldn't run telemetry tests
-FAIL
-```
-
-```
-$ cat test.out
-I1016 13:31:00.967011    1348 crash_test.go:94] containerID = feefae314519bfdc442fc6bb4b223a959ca6300483d14fb9e43478c7454f604c
-I1016 13:31:01.125155    1348 crash_test.go:120] processID = da9de705bbd204fc7a0ffa247fc973daf0b80234a0ac382ab3ce74f4fe1c0814
-I1016 13:31:02.126712    1348 crash_test.go:145] processExited = true
-I1016 13:31:02.277126    1348 crash_test.go:107] containerExited = true
-```
-
-Additional information can be obtained by running the test with `v=2`,
-which causes the test to log full events recieved. This can be a lot
-of information, so it's highly recommended that stderr be redirected
-to a file.
-
-```
-$ make GOTESTFLAGS="-test.v -test.parallel 1 -args -v=2" test_functional 2>test.out
+--- PASS: TestCrash (1.93s)
+    --- PASS: TestCrash/buildContainer (0.16s)
+    --- PASS: TestCrash/runTelemetryTest (1.77s)
+PASS
 ```
 
 ### Performance Tests

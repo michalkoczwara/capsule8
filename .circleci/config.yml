@@ -1,0 +1,45 @@
+# Golang CircleCI 2.0 configuration file
+#
+# Check https://circleci.com/docs/2.0/language-go/ for more details
+version: 2
+jobs:
+  build:
+    docker:
+      # Use latest golang container
+      - image: circleci/golang
+    working_directory: /go/src/github.com/capsule8/capsule8
+    steps:
+      - checkout
+      
+      # Install dependencies here b/c circleci requires custom build containers
+      # to be in a public registry.
+      - run:
+          name: Install dependencies
+          command: |
+            go get -u github.com/golang/lint/golint
+        
+      - run:
+          name: Check source code syntax, formatting, style, and lint
+          command: make check
+      - run:
+          name: Run unit tests
+          command: make test
+      - run:
+          name: Run unit tests under memory sanitizer
+          command: if $(which clang); then make test_msan; else true; fi
+      - run:
+          name: Run unit tests under race detector
+          command: make test_race
+          
+      # Setup remote docker now to build container and run functional tests
+      - setup_remote_docker:
+      - run:
+          name: Run sensor container in background
+          command: DOCKER="sudo docker" make run_sensor_detach
+      - run:
+          name: Run functional tests
+          command: DOCKER="sudo docker" make run_functional_test
+      - run:
+          name: Stop sensor container if running
+          command: sudo docker stop capsule8-sensor || true
+          when: always
